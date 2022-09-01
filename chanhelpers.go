@@ -1,8 +1,7 @@
-package helpers
+package chantools
 
 import (
 	"context"
-	"log"
 	"sync"
 )
 
@@ -90,7 +89,7 @@ func ChanGenerator[C any](worker func(chan<- C), extensions ...ChanGeneratorExte
 	return output
 }
 
-func ChanErrGenerator[C any](worker func(chan<- C, chan<- error), extensions ...ChanGeneratorExtension[C]) (<-chan C, <-chan error) {
+func ChanErrGenerator[C any](worker func(c chan<- C, err chan<- error), extensions ...ChanGeneratorExtension[C]) (<-chan C, <-chan error) {
 	output := make(chan C)
 	err := make(chan error)
 	go func(o chan<- C, e chan<- error) {
@@ -106,15 +105,16 @@ func ChanErrGenerator[C any](worker func(chan<- C, chan<- error), extensions ...
 	return output, err
 }
 
-func MapChan[I any, O any](input <-chan I, mapper func(input I) (O, error), extensions ...ChanGeneratorExtension[O]) <-chan O {
-	return ChanGenerator(func(c chan<- O) {
+func MapChan[I any, O any](input <-chan I, mapper func(input I) (O, error), extensions ...ChanGeneratorExtension[O]) (<-chan O, <-chan error) {
+	return ChanErrGenerator(func(c chan<- O, e chan<- error) {
 		for inputData := range input {
 			output, err := mapper(inputData)
 			if err != nil {
-				log.Printf("Mapping failed with err: %v", err)
-				return
+				e <- err
+			} else {
+				c <- output
+
 			}
-			c <- output
 		}
 	}, extensions...)
 }
@@ -194,11 +194,13 @@ func CastToReader[T any](ch []chan T) []<-chan T {
 }
 
 func CastToAny[T any](ch <-chan T) <-chan any {
-	return MapChan(ch, func(input T) (any, error) { return input, nil })
+	mi, _ := MapChan(ch, func(input T) (any, error) { return input, nil })
+	return mi
 }
 
 func CastTo[T any](ch <-chan any) <-chan T {
-	return MapChan(ch, func(input any) (T, error) { return input.(T), nil })
+	mi, _ := MapChan(ch, func(input any) (T, error) { return input.(T), nil })
+	return mi
 }
 
 func MapSlice[I any, O any](input []I, mapper func(input I) O) []O {
