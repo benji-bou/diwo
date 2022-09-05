@@ -62,7 +62,7 @@ func ChanBuffErrGenerator[C any](worker func(chan<- C, chan<- error), count int,
 	err := make(chan error)
 	go func(o chan<- C, e chan<- error) {
 		defer close(o)
-		defer close(err)
+		defer close(e)
 		if len(extensions) > 0 {
 			extensions[0](o)
 		}
@@ -76,7 +76,7 @@ func ChanBuffErrGenerator[C any](worker func(chan<- C, chan<- error), count int,
 
 func ChanGenerator[C any](worker func(chan<- C), extensions ...ChanGeneratorExtension[C]) <-chan C {
 	output := make(chan C)
-	go func(chan<- C) {
+	go func(output chan<- C) {
 		defer close(output)
 		if len(extensions) > 0 {
 			extensions[0](output)
@@ -94,6 +94,7 @@ func ChanErrGenerator[C any](worker func(c chan<- C, err chan<- error), extensio
 	err := make(chan error)
 	go func(o chan<- C, e chan<- error) {
 		defer close(o)
+		defer close(e)
 		if len(extensions) > 0 {
 			extensions[0](o)
 		}
@@ -290,11 +291,14 @@ type BrokerChan[E any] struct {
 
 func (bc *BrokerChan[E]) run() {
 	go func() {
-
+		var wg sync.WaitGroup
 		defer func() {
+			wg.Wait()
 			for _, l := range bc.listeners {
 				close(l)
+
 			}
+			close(bc.newListener)
 		}()
 		for {
 			select {
@@ -303,8 +307,10 @@ func (bc *BrokerChan[E]) run() {
 					return
 				}
 				for _, l := range bc.listeners {
+					wg.Add(1)
 					go func(v E, l chan E) {
 						l <- v
+						wg.Done()
 					}(s, l)
 				}
 			case nl := <-bc.newListener:
