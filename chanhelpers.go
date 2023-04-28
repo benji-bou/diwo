@@ -2,7 +2,10 @@ package chantools
 
 import (
 	"context"
+	"fmt"
+	"log"
 	"sync"
+	"time"
 )
 
 type ChanGeneratorExtension[I any] func(c chan<- I)
@@ -338,4 +341,46 @@ func ForEach[T any](inputSlice []T, each func(input T)) {
 	for _, input := range inputSlice {
 		each(input)
 	}
+}
+
+func MergeMap[K comparable, V any](elem ...map[K]V) (map[K]V, error) {
+	if len(elem) == 0 {
+		return nil, fmt.Errorf("Empty input")
+	} else if len(elem) == 1 {
+		return elem[0], nil
+	} else {
+		res := elem[0]
+		for i := 1; i < len(elem); i++ {
+			toMerge := elem[i]
+			for k, v := range toMerge {
+				if _, exist := res[k]; exist {
+					log.Printf("key %v already exist", k)
+					return nil, fmt.Errorf("key %v already exist", k)
+				}
+				res[k] = v
+			}
+		}
+		return res, nil
+	}
+
+}
+
+func Tick[I any](ctx context.Context, interval time.Duration, generate func() (I, error)) (<-chan I, <-chan error) {
+	tick := time.NewTicker(interval)
+	return ChanErrGenerator(func(c chan<- I, errC chan<- error) {
+		for {
+			select {
+			case <-tick.C:
+				elem, err := generate()
+				if err != nil {
+					errC <- err
+				} else {
+					c <- elem
+				}
+			case <-ctx.Done():
+				tick.Stop()
+				return
+			}
+		}
+	})
 }
