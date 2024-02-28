@@ -2,26 +2,62 @@ package chantools
 
 import (
 	"context"
-	"fmt"
-	"log"
+	"log/slog"
 	"sync"
 	"time"
+
+	"github.com/google/uuid"
 )
 
-type ChanGeneratorExtension[I any] func(c chan<- I)
+type newChanOptions[I any] func(ct *chanToolsConfig[I])
 type ForwardToExtensions[I any] func(c I) error
 
 // var ErrorLog = pterm.DefaultBasicText.WithStyle(pterm.NewStyle(pterm.FgRed))
 // var WarningLog = pterm.DefaultBasicText.WithStyle(pterm.NewStyle(pterm.FgYellow))
 // var InfoLog = pterm.DefaultBasicText.WithStyle(pterm.NewStyle(pterm.FgBlue))
 
-func WithInitialValue[I any](initialValue I) func(c chan<- I) {
-	return func(c chan<- I) {
-		c <- initialValue
+type chanToolsConfig[T any] struct {
+	output          chan T
+	errC            chan error
+	b               int64
+	initialValue    T
+	hasInitialValue bool
+	lastValue       T
+	hasLastValue    bool
+	params          []any
+}
+
+func WithInitialValue[I any](initialValue I) func(ct *chanToolsConfig[I]) {
+	return func(ct *chanToolsConfig[I]) {
+		ct.initialValue = initialValue
+		ct.hasInitialValue = true
+	}
+}
+func WithLastValue[I any](lasValue I) func(ct *chanToolsConfig[I]) {
+	return func(ct *chanToolsConfig[I]) {
+		ct.lastValue = lasValue
+		ct.hasLastValue = true
 	}
 }
 
-func MergeChan[E any](inputs ...<-chan E) <-chan E {
+func withErrChan[I any]() func(ct *chanToolsConfig[I]) {
+	return func(ct *chanToolsConfig[I]) {
+		ct.errC = make(chan error)
+	}
+}
+
+func WithBuffer[I any](count int64) func(ct *chanToolsConfig[I]) {
+	return func(ct *chanToolsConfig[I]) {
+		ct.b = count
+	}
+}
+func WithParam[I any](p ...any) func(ct *chanToolsConfig[I]) {
+	return func(ct *chanToolsConfig[I]) {
+		ct.params = append(ct.params, p...)
+	}
+}
+
+func Merge[E any](inputs ...<-chan E) <-chan E {
 	var wg sync.WaitGroup
 	merged := make(chan E, 10000)
 	wg.Add(len(inputs))
@@ -45,86 +81,76 @@ func MergeChan[E any](inputs ...<-chan E) <-chan E {
 	return merged
 }
 
-func ChanBuffGenerator[C any](worker func(chan<- C), count int, extensions ...ChanGeneratorExtension[C]) <-chan C {
-	output := make(chan C, count)
-	go func(chan<- C) {
-		defer close(output)
-		if len(extensions) > 0 {
-			extensions[0](output)
-		}
-		worker(output)
-		if len(extensions) > 1 {
-			extensions[1](output)
-		}
-	}(output)
-	return output
+func new[C any](option ...newChanOptions[C]) chanToolsConfig[C] {
+	cc := chanToolsConfig[C]{
+		output:          make(chan C),
+		errC:            nil,
+		hasInitialValue: false,
+		hasLastValue:    false,
+		b:               0,
+		params:          []any{},
+	}
+	for _, o := range option {
+		o(&cc)
+	}
+	return cc
 }
 
-func ChanBuffErrGenerator[C any](worker func(chan<- C, chan<- error), count int, extensions ...ChanGeneratorExtension[C]) (<-chan C, <-chan error) {
-	output := make(chan C, count)
-	err := make(chan error)
-	go func(o chan<- C, e chan<- error) {
-		defer close(o)
-		defer close(e)
-		if len(extensions) > 0 {
-			extensions[0](o)
-		}
-		worker(o, e)
-		if len(extensions) > 1 {
-			extensions[1](o)
-		}
-	}(output, err)
-	return output, err
+func Once[C any](value C) <-chan C {
+	return New(func(c chan<- C, params ...any) {}, WithLastValue[C](value))
 }
 
-func ChanGenerator[C any](worker func(chan<- C), extensions ...ChanGeneratorExtension[C]) <-chan C {
-	output := make(chan C)
-	go func(output chan<- C) {
-		defer close(output)
-		if len(extensions) > 0 {
-			extensions[0](output)
+func New[C any](worker func(c chan<- C, params ...any), option ...newChanOptions[C]) <-chan C {
+	cc := new(option...)
+	go func(cc chanToolsConfig[C]) {
+		defer close(cc.output)
+		if cc.hasInitialValue {
+			cc.output <- cc.initialValue
 		}
-		worker(output)
-		if len(extensions) > 1 {
-			extensions[1](output)
+		worker(cc.output, cc.params...)
+		if cc.hasLastValue {
+			cc.output <- cc.lastValue
 		}
-	}(output)
-	return output
+	}(cc)
+	return cc.output
 }
 
-func ChanErrGenerator[C any](worker func(c chan<- C, err chan<- error), extensions ...ChanGeneratorExtension[C]) (<-chan C, <-chan error) {
-	output := make(chan C)
-	err := make(chan error)
-	go func(o chan<- C, e chan<- error) {
-		defer close(o)
-		defer close(e)
-		if len(extensions) > 0 {
-			extensions[0](o)
+func NewWithErr[C any](worker func(c chan<- C, eC chan<- error, params ...any), option ...newChanOptions[C]) (<-chan C, <-chan error) {
+	option = append(option, withErrChan[C]())
+	cc := new(option...)
+	go func(cc chanToolsConfig[C]) {
+		uuid := uuid.NewString()
+		slog.Debug("starting new go routine")
+		defer close(cc.output)
+		defer close(cc.errC)
+		if cc.hasInitialValue {
+			cc.output <- cc.initialValue
 		}
-		worker(o, e)
-		if len(extensions) > 1 {
-			extensions[1](o)
+		worker(cc.output, cc.errC, cc.params...)
+		if cc.hasLastValue {
+			cc.output <- cc.lastValue
 		}
-	}(output, err)
-	return output, err
+		slog.Debug("stop go routine")
+	}(cc)
+	return cc.output, cc.errC
 }
 
-func MapChan[I any, O any](input <-chan I, mapper func(input I) (O, error), extensions ...ChanGeneratorExtension[O]) (<-chan O, <-chan error) {
-	return ChanErrGenerator(func(c chan<- O, e chan<- error) {
+func MapChan[I any, O any](input <-chan I, mapper func(input I) (O, error), option ...newChanOptions[O]) (<-chan O, <-chan error) {
+	return NewWithErr(func(c chan<- O, eC chan<- error, params ...any) {
 		for inputData := range input {
 			output, err := mapper(inputData)
 			if err != nil {
-				e <- err
+				eC <- err
 			} else {
 				c <- output
 
 			}
 		}
-	}, extensions...)
+	}, option...)
 }
 
 func FlatChan[I any](input <-chan []I) <-chan I {
-	return ChanGenerator(func(c chan<- I) {
+	return New(func(c chan<- I, params ...any) {
 		for i := range input {
 			for _, v := range i {
 				c <- v
@@ -153,20 +179,24 @@ func ForwardTo[T any](ctx context.Context, src <-chan T, dst chan<- T, extension
 
 }
 
-func ForwardIf[T any](src <-chan T, where func(element T) bool, extensions ...ChanGeneratorExtension[T]) <-chan T {
-	return ChanGenerator[T](func(c chan<- T) {
+func ForwardIf[T any](src <-chan T, where func(element T) bool, option ...newChanOptions[T]) <-chan T {
+	return New[T](func(c chan<- T, params ...any) {
 		for s := range src {
 			if where(s) {
 				c <- s
 			}
 		}
-	}, extensions...)
+	}, option...)
 }
 
 func BroadcastSync[T any](src <-chan T, qty uint) []<-chan T {
 	dst := MakeSliceChan[T](qty)
 	go func(src <-chan T, dst ...chan T) {
-		defer ForEach(dst, func(input chan T) { close(input) })
+		defer func(dst []chan T) {
+			for _, t := range dst {
+				close(t)
+			}
+		}(dst)
 		for inputData := range src {
 			for _, d := range dst {
 				d <- inputData
@@ -179,7 +209,11 @@ func BroadcastSync[T any](src <-chan T, qty uint) []<-chan T {
 func Broadcast[T any](src <-chan T, qty uint) []<-chan T {
 	dst := MakeSliceChan[T](qty)
 	go func(src <-chan T, dst ...chan T) {
-		defer ForEach(dst, func(input chan T) { close(input) })
+		defer func(dst []chan T) {
+			for _, t := range dst {
+				close(t)
+			}
+		}(dst)
 		for inputData := range src {
 			for _, d := range dst {
 				go func(inputData T, d chan<- T) {
@@ -215,7 +249,7 @@ func MapSlice[I any, O any](input []I, mapper func(input I) O) []O {
 	return res
 }
 
-func ForEachChan[T any](src <-chan T, each func(element T)) {
+func ForEach[T any](src <-chan T, each func(element T)) {
 	go func() {
 		for s := range src {
 			each(s)
@@ -266,7 +300,7 @@ func (lp *ListenProperty[E]) Set(value E) {
 }
 
 func (lp *ListenProperty[E]) Forward(ctx context.Context, i <-chan E) {
-	ForEachChan(i, func(element E) {
+	ForEach(i, func(element E) {
 		lp.Set(element)
 	})
 }
@@ -337,37 +371,37 @@ func (bc *BrokerChan[E]) Subscribe() <-chan E {
 // 	return res
 // }
 
-func ForEach[T any](inputSlice []T, each func(input T)) {
-	for _, input := range inputSlice {
-		each(input)
-	}
-}
+// func ForEach[T any](inputSlice []T, each func(input T)) {
+// 	for _, input := range inputSlice {
+// 		each(input)
+// 	}
+// }
 
-func MergeMap[K comparable, V any](elem ...map[K]V) (map[K]V, error) {
-	if len(elem) == 0 {
-		return nil, fmt.Errorf("Empty input")
-	} else if len(elem) == 1 {
-		return elem[0], nil
-	} else {
-		res := elem[0]
-		for i := 1; i < len(elem); i++ {
-			toMerge := elem[i]
-			for k, v := range toMerge {
-				if _, exist := res[k]; exist {
-					log.Printf("key %v already exist", k)
-					return nil, fmt.Errorf("key %v already exist", k)
-				}
-				res[k] = v
-			}
-		}
-		return res, nil
-	}
+// func MergeMap[K comparable, V any](elem ...map[K]V) (map[K]V, error) {
+// 	if len(elem) == 0 {
+// 		return nil, fmt.Errorf("Empty input")
+// 	} else if len(elem) == 1 {
+// 		return elem[0], nil
+// 	} else {
+// 		res := elem[0]
+// 		for i := 1; i < len(elem); i++ {
+// 			toMerge := elem[i]
+// 			for k, v := range toMerge {
+// 				if _, exist := res[k]; exist {
+// 					log.Printf("key %v already exist", k)
+// 					return nil, fmt.Errorf("key %v already exist", k)
+// 				}
+// 				res[k] = v
+// 			}
+// 		}
+// 		return res, nil
+// 	}
 
-}
+// }
 
 func Tick[I any](ctx context.Context, interval time.Duration, generate func() (I, error)) (<-chan I, <-chan error) {
 	tick := time.NewTicker(interval)
-	return ChanErrGenerator(func(c chan<- I, errC chan<- error) {
+	return NewWithErr(func(c chan<- I, errC chan<- error, params ...any) {
 		for {
 			select {
 			case <-tick.C:
