@@ -9,7 +9,7 @@ import (
 	"github.com/google/uuid"
 )
 
-type newChanOptions[I any] func(ct *chanToolsConfig[I])
+type NewChanOptions[I any] func(ct *chanToolsConfig[I])
 type ForwardToExtensions[I any] func(c I) error
 
 // var ErrorLog = pterm.DefaultBasicText.WithStyle(pterm.NewStyle(pterm.FgRed))
@@ -17,43 +17,49 @@ type ForwardToExtensions[I any] func(c I) error
 // var InfoLog = pterm.DefaultBasicText.WithStyle(pterm.NewStyle(pterm.FgBlue))
 
 type chanToolsConfig[T any] struct {
-	output          chan T
+	outputC         chan T
 	errC            chan error
-	b               int64
 	initialValue    T
 	hasInitialValue bool
 	lastValue       T
 	hasLastValue    bool
 	params          []any
+	isNonBlocking   bool
 }
 
-func WithInitialValue[I any](initialValue I) func(ct *chanToolsConfig[I]) {
+func WithInitialValue[I any](initialValue I) NewChanOptions[I] {
 	return func(ct *chanToolsConfig[I]) {
 		ct.initialValue = initialValue
 		ct.hasInitialValue = true
 	}
 }
-func WithLastValue[I any](lasValue I) func(ct *chanToolsConfig[I]) {
+func WithLastValue[I any](lasValue I) NewChanOptions[I] {
 	return func(ct *chanToolsConfig[I]) {
 		ct.lastValue = lasValue
 		ct.hasLastValue = true
 	}
 }
 
-func withErrChan[I any]() func(ct *chanToolsConfig[I]) {
+func withErrChan[I any]() NewChanOptions[I] {
 	return func(ct *chanToolsConfig[I]) {
 		ct.errC = make(chan error)
 	}
 }
 
-func WithBuffer[I any](count int64) func(ct *chanToolsConfig[I]) {
+func WithBuffer[I any](count int64) NewChanOptions[I] {
 	return func(ct *chanToolsConfig[I]) {
-		ct.b = count
+		ct.outputC = make(chan I, count)
 	}
 }
-func WithParam[I any](p ...any) func(ct *chanToolsConfig[I]) {
+func WithParam[I any](p ...any) NewChanOptions[I] {
 	return func(ct *chanToolsConfig[I]) {
 		ct.params = append(ct.params, p...)
+	}
+}
+
+func WithNonBlocking[I any]() NewChanOptions[I] {
+	return func(ct *chanToolsConfig[I]) {
+		ct.isNonBlocking = true
 	}
 }
 
@@ -61,7 +67,7 @@ func Merge[E any](inputs ...<-chan E) <-chan E {
 	var wg sync.WaitGroup
 	merged := make(chan E, 10000)
 	wg.Add(len(inputs))
-	output := func(sc <-chan E) {
+	outputC := func(sc <-chan E) {
 		for sqr := range sc {
 			merged <- sqr
 		}
@@ -71,7 +77,7 @@ func Merge[E any](inputs ...<-chan E) <-chan E {
 		if optChan == nil {
 			wg.Done()
 		} else {
-			go output(optChan)
+			go outputC(optChan)
 		}
 	}
 	go func() {
@@ -81,68 +87,125 @@ func Merge[E any](inputs ...<-chan E) <-chan E {
 	return merged
 }
 
-func new[C any](option ...newChanOptions[C]) chanToolsConfig[C] {
+func new[C any](option ...NewChanOptions[C]) chanToolsConfig[C] {
 	cc := chanToolsConfig[C]{
-		output:          make(chan C),
+		outputC:         nil,
 		errC:            nil,
 		hasInitialValue: false,
 		hasLastValue:    false,
-		b:               0,
 		params:          []any{},
+		isNonBlocking:   false,
 	}
 	for _, o := range option {
 		o(&cc)
 	}
+	if cc.outputC == nil {
+		cc.outputC = make(chan C)
+	}
 	return cc
+}
+
+func (cc chanToolsConfig[C]) start(startWorker func(inputC chan<- C, inputErrC chan<- error, params ...any)) {
+	if cc.isNonBlocking {
+		go cc.infiniteImpl(startWorker)
+	} else {
+		go cc.defaultImpl(startWorker)
+	}
+
+}
+
+// startInfinitBroker transfer inputC data to outputC. the caller can write to inputC without blocking.
+// this function takes outputC ownership. Which means it handle closing outputC when no more data is available and inputC is closed
+func startInfinitBroker[T any](inputC <-chan T, outputC chan<- T) {
+	go func() {
+		buff := make([]T, 0)
+		for {
+			var nextData T
+			var nextUpdateC chan<- T
+			if len(buff) > 0 {
+				nextData = buff[0]
+				nextUpdateC = outputC
+			} else if inputC == nil {
+				return
+			}
+			select {
+			case inputData, ok := <-inputC:
+				if !ok {
+					inputC = nil
+				}
+				buff = append(buff, inputData)
+			case nextUpdateC <- nextData:
+				buff = buff[1:]
+
+			}
+		}
+	}()
+}
+
+// solution from https://go.dev/talks/2013/advconc.slide#30
+func (cc chanToolsConfig[C]) infiniteImpl(startWorker func(inputC chan<- C, inputErrC chan<- error, params ...any)) {
+	inputC := make(chan C)
+	defer close(inputC)
+	defer close(cc.outputC)
+	defer close(cc.errC)
+
+	go startInfinitBroker(inputC, cc.outputC)
+
+	id := uuid.NewString()
+	slog.Debug("starting new go routine", "id", id)
+
+	if cc.hasInitialValue {
+		inputC <- cc.initialValue
+	}
+	startWorker(inputC, cc.errC, cc.params...)
+	if cc.hasLastValue {
+		inputC <- cc.lastValue
+	}
+	slog.Debug("stop go routine", "id", id)
+
+}
+
+func (cc chanToolsConfig[C]) defaultImpl(startWorker func(inputC chan<- C, inputErrC chan<- error, params ...any)) {
+	id := uuid.NewString()
+	slog.Debug("starting new go routine", "id", id)
+
+	defer close(cc.outputC)
+	defer close(cc.errC)
+	if cc.hasInitialValue {
+		cc.outputC <- cc.initialValue
+	}
+	startWorker(cc.outputC, cc.errC, cc.params...)
+	if cc.hasLastValue {
+		cc.outputC <- cc.lastValue
+	}
+	slog.Debug("stop go routine", "id", id)
 }
 
 func Once[C any](value C) <-chan C {
 	return New(func(c chan<- C, params ...any) {}, WithLastValue[C](value))
 }
 
-func New[C any](worker func(c chan<- C, params ...any), option ...newChanOptions[C]) <-chan C {
+func New[C any](worker func(c chan<- C, params ...any), option ...NewChanOptions[C]) <-chan C {
 	cc := new(option...)
-	go func(cc chanToolsConfig[C]) {
-		defer close(cc.output)
-		if cc.hasInitialValue {
-			cc.output <- cc.initialValue
-		}
-		worker(cc.output, cc.params...)
-		if cc.hasLastValue {
-			cc.output <- cc.lastValue
-		}
-	}(cc)
-	return cc.output
+	cc.start(func(inputC chan<- C, inputErrC chan<- error, params ...any) { worker(inputC, cc.params...) })
+	return cc.outputC
 }
 
-func NewWithErr[C any](worker func(c chan<- C, eC chan<- error, params ...any), option ...newChanOptions[C]) (<-chan C, <-chan error) {
+func NewWithErr[C any](worker func(c chan<- C, eC chan<- error, params ...any), option ...NewChanOptions[C]) (<-chan C, <-chan error) {
 	option = append(option, withErrChan[C]())
 	cc := new(option...)
-	go func(cc chanToolsConfig[C]) {
-		uuid := uuid.NewString()
-		slog.Debug("starting new go routine")
-		defer close(cc.output)
-		defer close(cc.errC)
-		if cc.hasInitialValue {
-			cc.output <- cc.initialValue
-		}
-		worker(cc.output, cc.errC, cc.params...)
-		if cc.hasLastValue {
-			cc.output <- cc.lastValue
-		}
-		slog.Debug("stop go routine")
-	}(cc)
-	return cc.output, cc.errC
+	cc.start(func(inputC chan<- C, inputErrC chan<- error, params ...any) { worker(inputC, inputErrC, params...) })
+	return cc.outputC, cc.errC
 }
 
-func MapChan[I any, O any](input <-chan I, mapper func(input I) (O, error), option ...newChanOptions[O]) (<-chan O, <-chan error) {
+func MapChan[I any, O any](input <-chan I, mapper func(input I) (O, error), option ...NewChanOptions[O]) (<-chan O, <-chan error) {
 	return NewWithErr(func(c chan<- O, eC chan<- error, params ...any) {
 		for inputData := range input {
-			output, err := mapper(inputData)
+			outputC, err := mapper(inputData)
 			if err != nil {
 				eC <- err
 			} else {
-				c <- output
+				c <- outputC
 
 			}
 		}
@@ -179,7 +242,7 @@ func ForwardTo[T any](ctx context.Context, src <-chan T, dst chan<- T, extension
 
 }
 
-func ForwardIf[T any](src <-chan T, where func(element T) bool, option ...newChanOptions[T]) <-chan T {
+func ForwardIf[T any](src <-chan T, where func(element T) bool, option ...NewChanOptions[T]) <-chan T {
 	return New[T](func(c chan<- T, params ...any) {
 		for s := range src {
 			if where(s) {
@@ -264,140 +327,6 @@ func MakeSliceChan[T any](qty uint) []chan T {
 	}
 	return res
 }
-
-type ListenProperty[E any] struct {
-	value  E
-	c      chan<- E
-	ctx    context.Context
-	broker *BrokerChan[E]
-}
-
-func Listen[E any](initialProperty E) *ListenProperty[E] {
-	return ListenWithContext(context.Background(), initialProperty)
-}
-
-func ListenChan[E any](ctx context.Context, initialProperty E, src <-chan E) *ListenProperty[E] {
-	listenProp := ListenWithContext(ctx, initialProperty)
-	listenProp.Forward(ctx, src)
-	return listenProp
-}
-
-func ListenWithContext[E any](ctx context.Context, initialProperty E) *ListenProperty[E] {
-	c := make(chan E)
-	lp := &ListenProperty[E]{value: initialProperty, c: c, broker: NewBrokerChan(c), ctx: ctx}
-	return lp
-}
-
-func (lp ListenProperty[E]) Value() E {
-	return lp.value
-}
-
-func (lp *ListenProperty[E]) Set(value E) {
-	lp.value = value
-	go func(value E) {
-		lp.c <- value
-	}(value)
-}
-
-func (lp *ListenProperty[E]) Forward(ctx context.Context, i <-chan E) {
-	ForEach(i, func(element E) {
-		lp.Set(element)
-	})
-}
-
-func (lp ListenProperty[E]) Updates() <-chan E {
-	return lp.broker.Subscribe()
-}
-
-func (lp ListenProperty[E]) Close() {
-	close(lp.c)
-}
-
-func NewBrokerChan[E any](src <-chan E) *BrokerChan[E] {
-
-	b := &BrokerChan[E]{src: src, listeners: make([]chan E, 0), newListener: make(chan chan E)}
-	b.run()
-	return b
-}
-
-type BrokerChan[E any] struct {
-	src         <-chan E
-	listeners   []chan E
-	newListener chan chan E
-}
-
-func (bc *BrokerChan[E]) run() {
-	go func() {
-		var wg sync.WaitGroup
-		defer func() {
-			wg.Wait()
-			for _, l := range bc.listeners {
-				close(l)
-
-			}
-			close(bc.newListener)
-		}()
-		for {
-			select {
-			case s, isOk := <-bc.src:
-				if !isOk {
-					return
-				}
-				for _, l := range bc.listeners {
-					wg.Add(1)
-					go func(v E, l chan E) {
-						l <- v
-						wg.Done()
-					}(s, l)
-				}
-			case nl := <-bc.newListener:
-				bc.listeners = append(bc.listeners, nl)
-			}
-		}
-	}()
-}
-
-func (bc *BrokerChan[E]) Subscribe() <-chan E {
-	l := make(chan E)
-	bc.newListener <- l
-	return l
-}
-
-// func Map[S any, D any](src []S, mapper func(element S) D) []D {
-// 	res := make([]D, len(src))
-// 	for i, e := range src {
-// 		res[i] = mapper(e)
-// 	}
-// 	return res
-// }
-
-// func ForEach[T any](inputSlice []T, each func(input T)) {
-// 	for _, input := range inputSlice {
-// 		each(input)
-// 	}
-// }
-
-// func MergeMap[K comparable, V any](elem ...map[K]V) (map[K]V, error) {
-// 	if len(elem) == 0 {
-// 		return nil, fmt.Errorf("Empty input")
-// 	} else if len(elem) == 1 {
-// 		return elem[0], nil
-// 	} else {
-// 		res := elem[0]
-// 		for i := 1; i < len(elem); i++ {
-// 			toMerge := elem[i]
-// 			for k, v := range toMerge {
-// 				if _, exist := res[k]; exist {
-// 					log.Printf("key %v already exist", k)
-// 					return nil, fmt.Errorf("key %v already exist", k)
-// 				}
-// 				res[k] = v
-// 			}
-// 		}
-// 		return res, nil
-// 	}
-
-// }
 
 func Tick[I any](ctx context.Context, interval time.Duration, generate func() (I, error)) (<-chan I, <-chan error) {
 	tick := time.NewTicker(interval)
