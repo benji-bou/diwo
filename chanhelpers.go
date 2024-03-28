@@ -25,6 +25,20 @@ type chanToolsConfig[T any] struct {
 	hasLastValue    bool
 	params          []any
 	isNonBlocking   bool
+	shouldNotClose  bool
+	name            string
+	ctx             context.Context
+}
+
+func WithName[I any](name string) NewChanOptions[I] {
+	return func(ct *chanToolsConfig[I]) {
+		ct.name = name
+	}
+}
+func WithNonManagedChannel[I any]() NewChanOptions[I] {
+	return func(ct *chanToolsConfig[I]) {
+		ct.shouldNotClose = true
+	}
 }
 
 func WithInitialValue[I any](initialValue I) NewChanOptions[I] {
@@ -41,9 +55,9 @@ func WithLastValue[I any](lasValue I) NewChanOptions[I] {
 }
 
 func withErrChan[I any]() NewChanOptions[I] {
-	return func(ct *chanToolsConfig[I]) {
+	return NewChanOptions[I](func(ct *chanToolsConfig[I]) {
 		ct.errC = make(chan error)
-	}
+	})
 }
 
 func WithBuffer[I any](count int64) NewChanOptions[I] {
@@ -63,7 +77,14 @@ func WithNonBlocking[I any]() NewChanOptions[I] {
 	}
 }
 
-func Merge[E any](inputs ...<-chan E) <-chan E {
+// WithCOntext option will prevent the go routine to finish until the context.Done() chan return a result
+func WithContext[I any](ctx context.Context) NewChanOptions[I] {
+	return func(ct *chanToolsConfig[I]) {
+		ct.ctx = ctx
+	}
+}
+
+func Merge[E any, C <-chan E](inputs ...C) C {
 	var wg sync.WaitGroup
 	merged := make(chan E, 10000)
 	wg.Add(len(inputs))
@@ -87,7 +108,7 @@ func Merge[E any](inputs ...<-chan E) <-chan E {
 	return merged
 }
 
-func new[C any](option ...NewChanOptions[C]) chanToolsConfig[C] {
+func newChanConfig[C any](option ...NewChanOptions[C]) chanToolsConfig[C] {
 	cc := chanToolsConfig[C]{
 		outputC:         nil,
 		errC:            nil,
@@ -95,6 +116,8 @@ func new[C any](option ...NewChanOptions[C]) chanToolsConfig[C] {
 		hasLastValue:    false,
 		params:          []any{},
 		isNonBlocking:   false,
+		shouldNotClose:  false,
+		name:            uuid.NewString(),
 	}
 	for _, o := range option {
 		o(&cc)
@@ -118,6 +141,7 @@ func (cc chanToolsConfig[C]) start(startWorker func(inputC chan<- C, inputErrC c
 // this function takes outputC ownership. Which means it handle closing outputC when no more data is available and inputC is closed
 func startInfinitBroker[T any](inputC <-chan T, outputC chan<- T) {
 	go func() {
+		defer close(outputC)
 		buff := make([]T, 0)
 		for {
 			var nextData T
@@ -132,8 +156,10 @@ func startInfinitBroker[T any](inputC <-chan T, outputC chan<- T) {
 			case inputData, ok := <-inputC:
 				if !ok {
 					inputC = nil
+					continue
 				}
 				buff = append(buff, inputData)
+
 			case nextUpdateC <- nextData:
 				buff = buff[1:]
 
@@ -145,14 +171,19 @@ func startInfinitBroker[T any](inputC <-chan T, outputC chan<- T) {
 // solution from https://go.dev/talks/2013/advconc.slide#30
 func (cc chanToolsConfig[C]) infiniteImpl(startWorker func(inputC chan<- C, inputErrC chan<- error, params ...any)) {
 	inputC := make(chan C)
-	defer close(inputC)
-	defer close(cc.outputC)
-	defer close(cc.errC)
+	if !cc.shouldNotClose {
+		defer func() { slog.Debug("close inputC from infiniteImple", "inputC", inputC); close(inputC) }()
+
+	}
+	defer func() {
+		if cc.errC != nil {
+			close(cc.errC)
+		}
+	}()
 
 	go startInfinitBroker(inputC, cc.outputC)
 
-	id := uuid.NewString()
-	slog.Debug("starting new go routine", "id", id)
+	slog.Debug("starting new go routine", "id", cc.name)
 
 	if cc.hasInitialValue {
 		inputC <- cc.initialValue
@@ -161,16 +192,25 @@ func (cc chanToolsConfig[C]) infiniteImpl(startWorker func(inputC chan<- C, inpu
 	if cc.hasLastValue {
 		inputC <- cc.lastValue
 	}
-	slog.Debug("stop go routine", "id", id)
+	if cc.ctx != nil {
+		<-cc.ctx.Done()
+	}
+	slog.Debug("stop go routine", "id", cc.name)
 
 }
 
 func (cc chanToolsConfig[C]) defaultImpl(startWorker func(inputC chan<- C, inputErrC chan<- error, params ...any)) {
-	id := uuid.NewString()
-	slog.Debug("starting new go routine", "id", id)
 
-	defer close(cc.outputC)
-	defer close(cc.errC)
+	slog.Debug("starting new go routine", "id", cc.name)
+	if !cc.shouldNotClose {
+		defer close(cc.outputC)
+
+	}
+	defer func() {
+		if cc.errC != nil {
+			close(cc.errC)
+		}
+	}()
 	if cc.hasInitialValue {
 		cc.outputC <- cc.initialValue
 	}
@@ -178,7 +218,10 @@ func (cc chanToolsConfig[C]) defaultImpl(startWorker func(inputC chan<- C, input
 	if cc.hasLastValue {
 		cc.outputC <- cc.lastValue
 	}
-	slog.Debug("stop go routine", "id", id)
+	if cc.ctx != nil {
+		<-cc.ctx.Done()
+	}
+	slog.Debug("stop go routine", "id", cc.name)
 }
 
 func Once[C any](value C) <-chan C {
@@ -186,33 +229,28 @@ func Once[C any](value C) <-chan C {
 }
 
 func New[C any](worker func(c chan<- C, params ...any), option ...NewChanOptions[C]) <-chan C {
-	cc := new(option...)
+	cc := newChanConfig(option...)
 	cc.start(func(inputC chan<- C, inputErrC chan<- error, params ...any) { worker(inputC, cc.params...) })
 	return cc.outputC
 }
 
 func NewWithErr[C any](worker func(c chan<- C, eC chan<- error, params ...any), option ...NewChanOptions[C]) (<-chan C, <-chan error) {
 	option = append(option, withErrChan[C]())
-	cc := new(option...)
+	cc := newChanConfig(option...)
 	cc.start(func(inputC chan<- C, inputErrC chan<- error, params ...any) { worker(inputC, inputErrC, params...) })
 	return cc.outputC, cc.errC
 }
 
-func MapChan[I any, O any](input <-chan I, mapper func(input I) (O, error), option ...NewChanOptions[O]) (<-chan O, <-chan error) {
-	return NewWithErr(func(c chan<- O, eC chan<- error, params ...any) {
+func Map[I any, O any](input <-chan I, mapper func(input I) O, option ...NewChanOptions[O]) <-chan O {
+	return New(func(c chan<- O, params ...any) {
 		for inputData := range input {
-			outputC, err := mapper(inputData)
-			if err != nil {
-				eC <- err
-			} else {
-				c <- outputC
-
-			}
+			outputC := mapper(inputData)
+			c <- outputC
 		}
 	}, option...)
 }
 
-func FlatChan[I any](input <-chan []I) <-chan I {
+func Flatten[I any](input <-chan []I) <-chan I {
 	return New(func(c chan<- I, params ...any) {
 		for i := range input {
 			for _, v := range i {
@@ -222,16 +260,13 @@ func FlatChan[I any](input <-chan []I) <-chan I {
 	})
 }
 
-func ForwardTo[T any](ctx context.Context, src <-chan T, dst chan<- T, extension ...ForwardToExtensions[T]) {
+func ForwardTo[T any](ctx context.Context, src <-chan T, dst chan<- T) {
 	go func() {
 		for {
 			select {
 			case value, ok := <-src:
 				if !ok {
 					return
-				}
-				for _, e := range extension {
-					e(value)
 				}
 				dst <- value
 			case <-ctx.Done():
@@ -295,13 +330,12 @@ func CastToReader[T any](ch []chan T) []<-chan T {
 }
 
 func CastToAny[T any](ch <-chan T) <-chan any {
-	mi, _ := MapChan(ch, func(input T) (any, error) { return input, nil })
-	return mi
+	return Map(ch, func(input T) any { return input })
+
 }
 
 func CastTo[T any](ch <-chan any) <-chan T {
-	mi, _ := MapChan(ch, func(input any) (T, error) { return input.(T), nil })
-	return mi
+	return Map(ch, func(input any) T { return input.(T) })
 }
 
 func MapSlice[I any, O any](input []I, mapper func(input I) O) []O {

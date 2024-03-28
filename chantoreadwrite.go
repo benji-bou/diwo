@@ -3,6 +3,7 @@ package chantools
 import (
 	"fmt"
 	"io"
+	"log/slog"
 )
 
 // ChanWriter is really naive implementation of io.Writer to channel
@@ -25,7 +26,9 @@ func (cw *ChanWriter) Write(data []byte) (int, error) {
 
 func (cw *ChanWriter) Close() error {
 	cw.isClosed = true
+	slog.Debug("close inputC from infiniteImple", "cw.inputC", cw.inputC)
 	close(cw.inputC)
+
 	return nil
 }
 
