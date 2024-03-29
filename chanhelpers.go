@@ -306,8 +306,10 @@ func BroadcastSync[T any](src <-chan T, qty uint) []<-chan T {
 
 func Broadcast[T any](src <-chan T, qty uint) []<-chan T {
 	dst := MakeSliceChan[T](qty)
+	done := make(chan struct{}, 0)
 	go func(src <-chan T, dst ...chan T) {
 		defer func(dst []chan T) {
+			close(done)
 			for _, t := range dst {
 				close(t)
 			}
@@ -315,7 +317,11 @@ func Broadcast[T any](src <-chan T, qty uint) []<-chan T {
 		for inputData := range src {
 			for _, d := range dst {
 				go func(inputData T, d chan<- T) {
-					d <- inputData
+					select {
+					case d <- inputData:
+					case <-done:
+
+					}
 				}(inputData, d)
 			}
 		}
