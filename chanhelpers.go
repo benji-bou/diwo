@@ -366,7 +366,7 @@ func CastTo[T any](ch <-chan any) <-chan T {
 	return Map(ch, func(input any) T { return input.(T) })
 }
 
-func MapSlice[I any, O any](input []I, mapper func(input I) O) []O {
+func MapSlice[I any, IA ~[]I, O any](input IA, mapper func(input I) O) []O {
 	res := make([]O, len(input))
 	for i := 0; i < len(input); i++ {
 		res[i] = mapper(input[i])
