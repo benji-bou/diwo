@@ -108,6 +108,15 @@ func Merge[E any, C <-chan E](inputs ...C) C {
 	return merged
 }
 
+func Concat[E any, C <-chan E](inputs ...C) []E {
+	outputC := Merge(inputs...)
+	res := make([]E, 0, len(inputs))
+	for elem := range outputC {
+		res = append(res, elem)
+	}
+	return res
+}
+
 func newChanConfig[C any](option ...NewChanOptions[C]) chanToolsConfig[C] {
 	cc := chanToolsConfig[C]{
 		outputC:         nil,
@@ -241,6 +250,19 @@ func NewWithErr[C any](worker func(c chan<- C, eC chan<- error, params ...any), 
 	return cc.outputC, cc.errC
 }
 
+func NewSync[C any](worker func(c chan<- C, params ...any), option ...NewChanOptions[C]) []C {
+	cc := newChanConfig(option...)
+	cc.start(func(inputC chan<- C, inputErrC chan<- error, params ...any) { worker(inputC, cc.params...) })
+	return Concat(CastToReader(cc.outputC)...)
+}
+
+func NewSyncWithErr[C any](worker func(c chan<- C, eC chan<- error, params ...any), option ...NewChanOptions[C]) ([]C, []error) {
+	option = append(option, withErrChan[C]())
+	cc := newChanConfig(option...)
+	cc.start(func(inputC chan<- C, inputErrC chan<- error, params ...any) { worker(inputC, inputErrC, params...) })
+	return Concat(CastToReader(cc.outputC)...), Concat(CastToReader(cc.errC)...)
+}
+
 func Map[I any, O any](input <-chan I, mapper func(input I) O, option ...NewChanOptions[O]) <-chan O {
 	return New(func(c chan<- O, params ...any) {
 		for inputData := range input {
@@ -301,7 +323,7 @@ func BroadcastSync[T any](src <-chan T, qty uint) []<-chan T {
 			}
 		}
 	}(src, dst...)
-	return CastToReader(dst)
+	return CastToReader(dst...)
 }
 
 func Broadcast[T any](src <-chan T, qty uint) []<-chan T {
@@ -326,10 +348,10 @@ func Broadcast[T any](src <-chan T, qty uint) []<-chan T {
 			}
 		}
 	}(src, dst...)
-	return CastToReader(dst)
+	return CastToReader(dst...)
 }
 
-func CastToReader[T any](ch []chan T) []<-chan T {
+func CastToReader[T any](ch ...chan T) []<-chan T {
 	return MapSlice(ch, func(input chan T) <-chan T {
 		return input
 	})
