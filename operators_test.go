@@ -158,23 +158,6 @@ func TestMap(t *testing.T) {
 	}
 }
 
-func TestFlatten(t *testing.T) {
-	expected := []int{1, 2, 3, 4, 5, 6, 3, 2, 1}
-	ch := FromSlice([][]int{
-		expected[:3],
-		expected[3:6],
-		expected[6:],
-	})
-	flattened := Flatten(ch)
-
-	for _, e := range expected {
-		value, ok := <-flattened
-		if !ok || value != e {
-			t.Errorf("Expected %d, got %v", e, value)
-		}
-	}
-}
-
 func TestForwardTo(t *testing.T) {
 	src := FromSlice([]int{1, 2, 3})
 	dst := make(chan int)

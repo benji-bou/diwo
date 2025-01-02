@@ -91,16 +91,6 @@ func Map[I any, O any](input <-chan I, mapper func(input I) O, option ...Options
 	}, option...)
 }
 
-func Flatten[I any](input <-chan []I, option ...Options) <-chan I {
-	return New(func(c chan<- I) {
-		for i := range input {
-			for _, v := range i {
-				c <- v
-			}
-		}
-	}, option...)
-}
-
 func ForwardTo[T any](src <-chan T, dst chan<- T) {
 	defer close(dst)
 	for elem := range src {
