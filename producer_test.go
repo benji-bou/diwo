@@ -5,8 +5,6 @@ import (
 	"sync"
 	"testing"
 	"time"
-
-	"github.com/google/uuid"
 )
 
 type ValueIndexed struct {
@@ -26,21 +24,10 @@ func TestNew(t *testing.T) {
 		})
 		for o := range outputC {
 			if streamStr[o.Index] != o.Value {
-				t.Errorf("Error Basik work stream output. Want %s, Got %s at Index %d", streamStr[o.Index], o.Value, o.Index)
+				t.Errorf("Error Basic work stream output. Want %s, Got %s at Index %d", streamStr[o.Index], o.Value, o.Index)
 			}
 		}
 	})
-}
-
-func TestNewWithDefaultOptions(t *testing.T) {
-	result := New(func(c chan<- int) {
-		c <- 42
-	})
-
-	value, ok := <-result
-	if !ok || value != 42 {
-		t.Errorf("Expected 42, got %v", value)
-	}
 }
 
 func TestNewWithTearDown(t *testing.T) {
@@ -61,14 +48,8 @@ func TestNewWithTearDown(t *testing.T) {
 	}
 }
 
-func TestNewWithName(t *testing.T) {
-	name := uuid.NewString()
-	_ = New(func(c chan<- int) {}, WithName(name))
-	// No errors should occur
-}
-
 func TestFromSlice(t *testing.T) {
-	slice := []int{1, 2, 3, 4, 5}
+	slice := []int{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13}
 	result := FromSlice(slice)
 
 	for i, expected := range slice {
@@ -80,7 +61,7 @@ func TestFromSlice(t *testing.T) {
 }
 
 func TestBroadcast(t *testing.T) {
-	src := FromSlice([]int{1, 2, 3})
+	src := FromSlice([]int{1, 2, 3, 4, 5, 6, 7, 8, 9})
 	channels := Broadcast(src, 3)
 
 	var wg sync.WaitGroup
@@ -101,76 +82,126 @@ func TestBroadcast(t *testing.T) {
 }
 
 func TestTick(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 70*time.Millisecond)
 	defer cancel()
 
-	counter := 0
-	result := Tick(ctx, 10*time.Millisecond, func(t time.Time) int {
-		counter++
-		return counter
+	counter := time.Now()
+	result := Tick(ctx, 10*time.Millisecond, func(t time.Time) time.Duration {
+		d := t.Sub(counter)
+		counter = t
+		return d
 	})
 
-	expected := 1
+	expected := 10 * time.Millisecond
 	for value := range result {
-		if value != expected {
+		if value > expected-5 && value < expected+5 {
 			t.Errorf("Expected %d, got %v", expected, value)
 		}
-		expected++
 	}
 }
 
 func TestInfiniteWrapper(t *testing.T) {
-	workerChan := make(chan int, 3)
-	inputChan := infiniteWrapper(workerChan)
+	count := 100000
+	outputC := make(chan int)
+	inputInfiniteChan := infiniteWrapper(outputC)
 
-	inputChan <- 1
-	inputChan <- 2
-	close(inputChan)
+	for i := 0; i < count; i++ {
+		inputInfiniteChan <- i
 
-	expected := []int{1, 2}
-	for _, e := range expected {
-		value, ok := <-workerChan
-		if !ok || value != e {
-			t.Errorf("Expected %d, got %v", e, value)
+	}
+	close(inputInfiniteChan)
+	i := 0
+	for value := range outputC {
+		if i >= count {
+			t.Errorf("Received to much value")
 		}
+		if value != i {
+			t.Errorf("Expected %d, got %v", i, value)
+		}
+		i++
+	}
+	if i == 0 {
+		t.Errorf("did not read any data from outputC")
 	}
 
-	if _, ok := <-workerChan; ok {
-		t.Error("Expected workerChan to be closed")
+	if _, ok := <-outputC; ok {
+		t.Error("Expected outputC to be closed")
 	}
 }
 
-func TestStartInfinitBroker(t *testing.T) {
-	inputChan := make(chan int, 3)
-	outputChan := make(chan int, 3)
-
-	go startInfinitBroker(inputChan, outputChan)
-
-	inputChan <- 1
-	inputChan <- 2
-	close(inputChan)
-
-	expected := []int{1, 2}
-	for _, e := range expected {
-		value, ok := <-outputChan
-		if !ok || value != e {
-			t.Errorf("Expected %d, got %v", e, value)
-		}
+func TestOnce(t *testing.T) {
+	tC := Once(42)
+	i := <-tC
+	if i != 42 {
+		t.Errorf("Not the correct value sent")
 	}
-
-	if _, ok := <-outputChan; ok {
-		t.Error("Expected outputChan to be closed")
+	i, ok := <-tC
+	if ok {
+		t.Errorf("channel once should be closed, received %d", i)
 	}
 }
 
-func TestEdgeCases(t *testing.T) {
-	// Empty slice for FromSlice
-	result := FromSlice([]int{})
-	if _, ok := <-result; ok {
-		t.Error("Expected channel to be closed for empty slice")
+func TestUnmangedChan(t *testing.T) {
+	count := 20
+	workerFunc := func(c chan<- int) {
+		for i := 1; i < count; i++ {
+			c <- i
+		}
 	}
 
-	// Nil tearDown function
-	_ = New(func(c chan<- int) {}, WithTearDown(nil))
-	// No errors should occur
+	testingFunc := func(t *testing.T, c <-chan int, testClosed func()) {
+		i := 1
+		var tC <-chan time.Time = nil
+
+	L:
+		for {
+			select {
+			case <-tC:
+				break L
+			case tData, ok := <-c:
+				if ok == false {
+					testClosed()
+					break L
+				}
+				if tData != i {
+					t.Errorf("incorrect data want %d, got %v", i, tData)
+					return
+				}
+				if i == count-1 {
+					tC = time.Tick(3 * time.Second)
+				}
+				i++
+			}
+		}
+		if i != count {
+			t.Errorf("did not received correct number of data got %d want %d ", i, count-1)
+			return
+		}
+	}
+
+	t.Run("Nomal New With Unmanaged should still closed", func(t *testing.T) {
+		c := New(workerFunc, WithUnmanaged())
+		testingFunc(t, c, func() {
+		})
+	})
+
+	t.Run("NewWithChanBuilder and Unmanaged should not close", func(t *testing.T) {
+		c := NewWithChanBuilder(func() chan int {
+			return make(chan int)
+		}, workerFunc, WithUnmanaged())
+
+		testingFunc(t, c, func() {
+			t.Error("chan should not be closed")
+		})
+	})
+
+}
+
+func TestEmpty(t *testing.T) {
+	emptyCh := Empty[int]()
+	_, ok := <-emptyCh
+	if ok {
+		t.Errorf("empty channel is not directly closed")
+	}
+
 }

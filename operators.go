@@ -1,15 +1,26 @@
 package diwo
 
-import "sync"
+import (
+	"slices"
+	"sync"
+)
 
-func syncForward[E any](src <-chan E, dst chan<- E, wg *sync.WaitGroup) {
-	defer wg.Done()
+func syncForward[E any](src <-chan E, dst chan<- E) {
 	for elem := range src {
 		dst <- elem
 	}
 }
 
-func Merge[E any, C <-chan E](inputs ...C) C {
+type UnionOperatorFunc[E any] func(inputs ...<-chan E) <-chan E
+
+func Merge[E any](inputs ...<-chan E) <-chan E {
+	if inputs == nil {
+		return Empty[E]()
+	}
+	inputs = slices.DeleteFunc(inputs, func(elem <-chan E) bool { return elem == nil })
+	if len(inputs) == 0 {
+		return Empty[E]()
+	}
 	if len(inputs) == 1 {
 		return inputs[0]
 	}
@@ -20,21 +31,55 @@ func Merge[E any, C <-chan E](inputs ...C) C {
 			if optChan == nil {
 				wg.Done()
 			} else {
-				go syncForward(optChan, merged, wg)
+				go func() {
+					defer wg.Done()
+					syncForward(optChan, merged)
+				}()
 			}
 		}
 		wg.Wait()
-	})
-
+	}, WithUnmanaged())
 }
 
-func Concat[E any, C <-chan E](inputs ...C) []E {
-	outputC := Merge(inputs...)
-	res := make([]E, 0, len(inputs))
-	for elem := range outputC {
-		res = append(res, elem)
+func Concat[E any](inputs ...<-chan E) <-chan E {
+	if inputs == nil {
+		return Empty[E]()
 	}
-	return res
+	inputs = slices.DeleteFunc(inputs, func(elem <-chan E) bool { return elem == nil })
+	if len(inputs) == 0 {
+		return Empty[E]()
+	}
+	if len(inputs) == 1 {
+		return inputs[0]
+	}
+	return New(func(c chan<- E) {
+		for _, input := range inputs {
+			for value := range input {
+				c <- value
+			}
+		}
+	})
+}
+
+type CollectorFunc[E any] func(inputs ...<-chan E) []E
+
+func Collect[E any](strat UnionOperatorFunc[E]) CollectorFunc[E] {
+	return func(inputs ...<-chan E) []E {
+		outputC := strat(inputs...)
+		res := make([]E, 0, len(inputs))
+		for elem := range outputC {
+			res = append(res, elem)
+		}
+		return res
+	}
+}
+
+func CollectMerge[E any](inputs ...<-chan E) []E {
+	return Collect[E](Merge)(inputs...)
+}
+
+func CollectConcat[E any](inputs ...<-chan E) []E {
+	return Collect[E](Concat)(inputs...)
 }
 
 func Map[I any, O any](input <-chan I, mapper func(input I) O, option ...Options) <-chan O {
@@ -57,6 +102,7 @@ func Flatten[I any](input <-chan []I, option ...Options) <-chan I {
 }
 
 func ForwardTo[T any](src <-chan T, dst chan<- T) {
+	defer close(dst)
 	for elem := range src {
 		dst <- elem
 	}

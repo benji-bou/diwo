@@ -5,51 +5,65 @@ import (
 )
 
 func NewBroker[E any](src <-chan E) *Broker[E] {
+	if src == nil {
+		src = Empty[E]()
+	}
+	b := &Broker[E]{
+		src:             src,
+		internalBridges: make(map[chan<- E]struct{}, 0),
+		mux:             &sync.RWMutex{},
+		isSrcClosed:     false,
+	}
 
-	b := &Broker[E]{src: src, listeners: make([]chan E, 0), newListener: make(chan chan E)}
-	b.run()
+	go b.run()
 	return b
 }
 
 type Broker[E any] struct {
-	src         <-chan E
-	listeners   []chan E
-	newListener chan chan E
+	src             <-chan E
+	internalBridges map[chan<- E]struct{}
+	isSrcClosed     bool
+
+	mux *sync.RWMutex
+}
+
+func (bc *Broker[E]) cleanup() {
+	for l := range bc.internalBridges {
+		close(l)
+		delete(bc.internalBridges, l)
+	}
+}
+
+func (bc *Broker[E]) startNewListener(listener chan E) {
+	bridge := infiniteWrapper(listener)
+	bc.internalBridges[bridge] = struct{}{}
 }
 
 func (bc *Broker[E]) run() {
-	go func() {
-		var wg sync.WaitGroup
-		defer func() {
-			wg.Wait()
-			for _, l := range bc.listeners {
-				close(l)
-
-			}
-			close(bc.newListener)
-		}()
-		for {
-			select {
-			case s, isOk := <-bc.src:
-				if !isOk {
-					return
-				}
-				for _, l := range bc.listeners {
-					wg.Add(1)
-					go func(v E, l chan E) {
-						l <- v
-						wg.Done()
-					}(s, l)
-				}
-			case nl := <-bc.newListener:
-				bc.listeners = append(bc.listeners, nl)
-			}
-		}
+	defer func() {
+		bc.mux.Lock()
+		bc.isSrcClosed = true
+		bc.cleanup()
+		bc.mux.Unlock()
 	}()
+
+	for s := range bc.src {
+		bc.mux.RLock()
+		for l := range bc.internalBridges {
+			l <- s
+		}
+		bc.mux.RUnlock()
+	}
 }
 
 func (bc *Broker[E]) Subscribe() <-chan E {
+	bc.mux.Lock()
+	defer bc.mux.Unlock()
+	if bc.isSrcClosed {
+		return Empty[E]()
+	}
 	l := make(chan E)
-	bc.newListener <- l
+	bc.startNewListener(l)
 	return l
+
 }

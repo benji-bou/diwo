@@ -2,7 +2,7 @@ package diwo
 
 import (
 	"context"
-	"sync"
+	"log/slog"
 	"time"
 
 	"github.com/google/uuid"
@@ -44,15 +44,15 @@ func WithName(name string) Options {
 	}
 }
 
-func WithParam(p ...any) Options {
-	return func(ct *produceConfig) {
-		ct.params = append(ct.params, p...)
-	}
-}
-
 func WithNonBlocking() Options {
 	return func(ct *produceConfig) {
 		ct.isNonBlocking = true
+	}
+}
+
+func WithUnmanaged() Options {
+	return func(ct *produceConfig) {
+		ct.shouldNotClose = true
 	}
 }
 
@@ -72,44 +72,52 @@ func defaultOutput[C any]() chan C {
 }
 
 // startInfinitBroker transfer inputC data to outputC. the caller can write to inputC without blocking.
-// this function takes outputC ownership. Which means it handle closing outputC when no more data is available and inputC is closed
+// this function takes outputC ownership. Which means it handles closing outputC when no more data is available and inputC is closed
 func startInfinitBroker[T any](inputC <-chan T, outputC chan<- T) {
-	go func() {
-		defer close(outputC)
-		buff := make([]T, 0)
-		for {
-			var nextData T
-			var nextUpdateC chan<- T
-			if len(buff) > 0 {
-				nextData = buff[0]
-				nextUpdateC = outputC
-			} else if inputC == nil {
-				return
-			}
+
+	defer close(outputC)
+	inputCIsClosed := false
+	buff := make([]T, 0)
+	for {
+		var nextData T
+		//Define a nil chan
+		var nextUpdateC chan<- T
+		if len(buff) > 0 {
+			nextData = buff[0]
+			// if something to send nextUpdateC is no more nil
+			nextUpdateC = outputC
+		} else if inputCIsClosed {
+			return
+		}
+		if !inputCIsClosed {
 			select {
 			case inputData, ok := <-inputC:
 				if !ok {
-					inputC = nil
+					inputCIsClosed = true
 					continue
 				}
 				buff = append(buff, inputData)
-
+				// if nextUpdateC not nil can send data otherwise case not evaluated
 			case nextUpdateC <- nextData:
 				buff = buff[1:]
 
 			}
+		} else {
+			nextUpdateC <- nextData
+			buff = buff[1:]
+
 		}
-	}()
+	}
 }
 
 // solution from https://go.dev/talks/2013/advconc.slide#30
-func infiniteWrapper[C any](workerC chan<- C) chan C {
+func infiniteWrapper[C any](workerC chan<- C) chan<- C {
 	inputC := make(chan C)
 	go startInfinitBroker(inputC, workerC)
 	return inputC
 }
 
-func start[C any](cc produceConfig, startWorker func(inputC chan<- C), workerCBuilder WorkerChanBuilder[C]) <-chan C {
+func start[C any](cc produceConfig, startWorker func(inputC chan<- C), workerCBuilder WorkerChanBuilder[C], isInternalBuilder bool) <-chan C {
 	workerC := workerCBuilder()
 	go func() {
 
@@ -118,31 +126,40 @@ func start[C any](cc produceConfig, startWorker func(inputC chan<- C), workerCBu
 				cc.tearDown()
 			}
 		}()
-		if !cc.shouldNotClose {
+		if !cc.shouldNotClose || isInternalBuilder {
 			defer close(workerC)
 
 		}
-
+		var inputC chan<- C = workerC
 		if cc.isNonBlocking {
-			workerC = infiniteWrapper(workerC)
+			inputC = infiniteWrapper(workerC)
 		}
-		startWorker(workerC)
+		startWorker(inputC)
 	}()
 	return workerC
 }
 
 func New[C any](worker func(c chan<- C), option ...Options) <-chan C {
 	cc := newChanConfig(option...)
-	return start(cc, worker, defaultOutput[C])
+	if cc.shouldNotClose {
+		slog.Warn("You declare an unmanged chan that you can't close yourself. So we will close it anyway. Please consider using NewWithChanBuilder instead")
+	}
+	return start(cc, worker, defaultOutput[C], true)
 }
 
 func NewWithChanBuilder[C any](builderC WorkerChanBuilder[C], worker func(c chan<- C), option ...Options) <-chan C {
 	cc := newChanConfig(option...)
-	return start(cc, worker, builderC)
+	return start(cc, worker, builderC, false)
 }
 
 func Once[C any](value C) <-chan C {
 	return New(func(c chan<- C) { c <- value })
+}
+
+func Empty[C any]() <-chan C {
+	emptyCh := make(chan C)
+	close(emptyCh)
+	return emptyCh
 }
 
 func FromSlice[C any, A ~[]C](input A) <-chan C {
@@ -153,27 +170,37 @@ func FromSlice[C any, A ~[]C](input A) <-chan C {
 	})
 }
 
-func Broadcast[T any](src <-chan T, qty uint) []<-chan T {
-	dst := MakeSliceChan[T](qty)
-	go func(src <-chan T, dst ...chan T) {
-		wg := &sync.WaitGroup{}
-		defer func(dst []chan T) {
-			for _, t := range dst {
-				close(t)
+func FromSliceStarter[C any, A ~[]C](input A) (func(), <-chan C) {
+	startC := make(chan struct{})
+	return func() {
+			close(startC)
+		}, New(func(c chan<- C) {
+			<-startC
+			for _, i := range input {
+				c <- i
 			}
-		}(dst)
-		for inputData := range src {
-			for _, d := range dst {
-				wg.Add(1)
-				go func(inputData T, d chan<- T) {
-					defer wg.Done()
-					d <- inputData
-				}(inputData, d)
+		})
+}
+
+func Broadcast[T any](src <-chan T, qty uint) []<-chan T {
+
+	dstFinals := MakeSliceChan[T](qty)
+	go func() {
+		dstInfinitWrappers := make([]chan<- T, 0, qty)
+		for _, dst := range dstFinals {
+			dstInfinitWrappers = append(dstInfinitWrappers, infiniteWrapper(dst))
+		}
+		for value := range src {
+			for _, dst := range dstInfinitWrappers {
+				dst <- value
 			}
 		}
-		wg.Wait()
-	}(src, dst...)
-	return CastToReader(dst...)
+		for _, dst := range dstInfinitWrappers {
+			close(dst)
+		}
+	}()
+
+	return CastToReader(dstFinals...)
 }
 
 func MakeSliceChan[T any](qty uint) []chan T {
