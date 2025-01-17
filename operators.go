@@ -28,17 +28,13 @@ func Merge[E any](inputs ...<-chan E) <-chan E {
 		wg := &sync.WaitGroup{}
 		wg.Add(len(inputs))
 		for _, optChan := range inputs {
-			if optChan == nil {
-				wg.Done()
-			} else {
-				go func() {
-					defer wg.Done()
-					syncForward(optChan, merged)
-				}()
-			}
+			go func() {
+				defer wg.Done()
+				syncForward(optChan, merged)
+			}()
 		}
 		wg.Wait()
-	}, WithUnmanaged())
+	})
 }
 
 func Concat[E any](inputs ...<-chan E) <-chan E {
@@ -124,7 +120,6 @@ func CastToReader[T any](ch ...chan T) []<-chan T {
 
 func CastToAny[T any](ch <-chan T) <-chan any {
 	return Map(ch, func(input T) any { return input })
-
 }
 
 func CastTo[T any](ch <-chan any) <-chan T {

@@ -8,8 +8,10 @@ import (
 	"github.com/google/uuid"
 )
 
-type Options func(ct *produceConfig)
-type ForwardToExtensions[I any] func(c I) error
+type (
+	Options                    func(ct *produceConfig)
+	ForwardToExtensions[I any] func(c I) error
+)
 
 // var ErrorLog = pterm.DefaultBasicText.WithStyle(pterm.NewStyle(pterm.FgRed))
 // var WarningLog = pterm.DefaultBasicText.WithStyle(pterm.NewStyle(pterm.FgYellow))
@@ -74,13 +76,12 @@ func defaultOutput[C any]() chan C {
 // startInfinitBroker transfer inputC data to outputC. the caller can write to inputC without blocking.
 // this function takes outputC ownership. Which means it handles closing outputC when no more data is available and inputC is closed
 func startInfinitBroker[T any](inputC <-chan T, outputC chan<- T) {
-
 	defer close(outputC)
 	inputCIsClosed := false
 	buff := make([]T, 0)
 	for {
 		var nextData T
-		//Define a nil chan
+		// Define a nil chan
 		var nextUpdateC chan<- T
 		if len(buff) > 0 {
 			nextData = buff[0]
@@ -117,26 +118,23 @@ func infiniteWrapper[C any](workerC chan<- C) chan<- C {
 	return inputC
 }
 
-func start[C any](cc produceConfig, startWorker func(inputC chan<- C), workerCBuilder WorkerChanBuilder[C], isInternalBuilder bool) <-chan C {
-	workerC := workerCBuilder()
+func start[C any](cc produceConfig, startWorker func(inputC chan<- C), outputC chan C, isInternalBuilder bool) <-chan C {
 	go func() {
-
 		defer func() {
 			if cc.tearDown != nil {
 				cc.tearDown()
 			}
 		}()
 		if !cc.shouldNotClose || isInternalBuilder {
-			defer close(workerC)
-
+			defer close(outputC)
 		}
-		var inputC chan<- C = workerC
+		var inputC chan<- C = outputC
 		if cc.isNonBlocking {
-			inputC = infiniteWrapper(workerC)
+			inputC = infiniteWrapper(outputC)
 		}
 		startWorker(inputC)
 	}()
-	return workerC
+	return outputC
 }
 
 func New[C any](worker func(c chan<- C), option ...Options) <-chan C {
@@ -144,12 +142,12 @@ func New[C any](worker func(c chan<- C), option ...Options) <-chan C {
 	if cc.shouldNotClose {
 		slog.Warn("You declare an unmanged chan that you can't close yourself. So we will close it anyway. Please consider using NewWithChanBuilder instead")
 	}
-	return start(cc, worker, defaultOutput[C], true)
+	return start(cc, worker, defaultOutput[C](), true)
 }
 
-func NewWithChanBuilder[C any](builderC WorkerChanBuilder[C], worker func(c chan<- C), option ...Options) <-chan C {
+func NewWithChan[C any](outputC chan C, worker func(c chan<- C), option ...Options) <-chan C {
 	cc := newChanConfig(option...)
-	return start(cc, worker, builderC, false)
+	return start(cc, worker, outputC, false)
 }
 
 func Once[C any](value C) <-chan C {
@@ -182,28 +180,33 @@ func FromSliceStarter[C any, A ~[]C](input A) (func(), <-chan C) {
 		})
 }
 
-func Broadcast[T any](src <-chan T, qty uint) []<-chan T {
-
-	dstFinals := MakeSliceChan[T](qty)
-	go func() {
-		dstInfinitWrappers := make([]chan<- T, 0, qty)
-		for _, dst := range dstFinals {
-			dstInfinitWrappers = append(dstInfinitWrappers, infiniteWrapper(dst))
-		}
-		for value := range src {
-			for _, dst := range dstInfinitWrappers {
-				dst <- value
+func Broadcast[T any](src <-chan T, qty int) []<-chan T {
+	switch qty {
+	case 0:
+		return []<-chan T{}
+	case 1:
+		return []<-chan T{src}
+	default:
+		dstFinals := MakeSliceChan[T](qty)
+		go func() {
+			dstInfinitWrappers := make([]chan<- T, 0, qty)
+			for _, dst := range dstFinals {
+				dstInfinitWrappers = append(dstInfinitWrappers, infiniteWrapper(dst))
 			}
-		}
-		for _, dst := range dstInfinitWrappers {
-			close(dst)
-		}
-	}()
-
-	return CastToReader(dstFinals...)
+			for value := range src {
+				for _, dst := range dstInfinitWrappers {
+					dst <- value
+				}
+			}
+			for _, dst := range dstInfinitWrappers {
+				close(dst)
+			}
+		}()
+		return CastToReader(dstFinals...)
+	}
 }
 
-func MakeSliceChan[T any](qty uint) []chan T {
+func MakeSliceChan[T any](qty int) []chan T {
 	res := make([]chan T, qty)
 	for i := range res {
 		res[i] = make(chan T)

@@ -186,9 +186,7 @@ func TestUnmangedChan(t *testing.T) {
 	})
 
 	t.Run("NewWithChanBuilder and Unmanaged should not close", func(t *testing.T) {
-		c := NewWithChanBuilder(func() chan int {
-			return make(chan int)
-		}, workerFunc, WithUnmanaged())
+		c := NewWithChan(make(chan int), workerFunc, WithUnmanaged())
 
 		testingFunc(t, c, func() {
 			t.Error("chan should not be closed")
