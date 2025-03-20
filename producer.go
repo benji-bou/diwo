@@ -180,6 +180,22 @@ func FromSliceStarter[C any, A ~[]C](input A) (func(), <-chan C) {
 		})
 }
 
+type MapElem[C any, K comparable] struct {
+	Key   K
+	Value C
+}
+
+func FromMap[C any, K comparable, A ~map[K]C](input A) <-chan MapElem[C, K] {
+	return New(func(c chan<- MapElem[C, K]) {
+		for k, e := range input {
+			c <- MapElem[C, K]{
+				Key:   k,
+				Value: e,
+			}
+		}
+	})
+}
+
 func Broadcast[T any](src <-chan T, qty int) []<-chan T {
 	switch qty {
 	case 0:
